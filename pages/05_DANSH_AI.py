@@ -89,14 +89,16 @@ def render_extras(m):
         st.progress(min(conf["score_pct"], 100) / 100, text=f"Confidence: {conf['label']} ({conf['balls']} balls)")
         for w in conf.get("warnings", []):
             st.warning(w)
-    for cap, fig in m.get("figures", []):
-        st.pyplot(fig, use_container_width=False)
-        st.caption(cap)
+    for cap, png in m.get("figures", []):
+        st.image(png, caption=cap)
     for title, df in m.get("tables", []):
         with st.expander(title):
             st.dataframe(df, use_container_width=True, hide_index=True)
     if m.get("filters"):
         st.caption("Filters: " + "; ".join(m["filters"]))
+    if m.get("timing"):
+        t = m["timing"]
+        st.caption(f"Time {t['total_s']}s: model {t['model_s']}s ({t['model_calls']} calls), calculations {t['calc_s']}s")
     if m.get("unverified"):
         st.caption("Numbers not found in the calculated results: " + ", ".join(m["unverified"]))
 
@@ -124,11 +126,12 @@ if q:
     with st.chat_message("assistant"):
         status = st.empty()
         try:
+            client.on_status = lambda s: status.caption(s)
             turn = run_turn(client, prep, q, history, state, on_status=lambda s: status.caption(s))
             status.empty()
             st.markdown(turn.text)
             m_out = {"role": "assistant", "content": turn.text, "figures": turn.figures, "tables": turn.tables,
-                     "confidence": turn.confidence, "filters": turn.filters, "unverified": turn.unverified}
+                     "confidence": turn.confidence, "filters": turn.filters, "unverified": turn.unverified, "timing": turn.timing}
             render_extras(m_out)
             msgs += [{"role": "user", "content": q}, m_out]
         except GroqError as e:
