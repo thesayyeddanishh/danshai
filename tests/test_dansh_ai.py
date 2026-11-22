@@ -290,13 +290,22 @@ def test_run_turn_end_to_end():
     p, st = prep(), {}
     t = run_turn(MockLLM(), p, "Binura death overs?", [], st)
     assert t.calls[0]["tool"] == "player_profile" and t.figures and t.tables and not t.unverified
+    assert isinstance(t.figures[0][1], bytes) and t.figures[0][1][:4] == b"\x89PNG"      # rendered once as PNG
+    assert set(t.timing) == {"total_s", "model_s", "model_calls", "calc_s"}
     assert st["last_entity"] == "BINURA FERNANDO" and t.confidence
 
 
-def test_number_guard_repairs_invented_numbers():
+def test_number_guard_flags_then_repairs():
+    from dansh_ai import config as C
     p = prep()
     t = run_turn(MockLLM(invent_first=True), p, "q", [], {})
-    assert "7.77" not in t.text
+    assert "7.77" in t.unverified and t.timing["model_calls"] == 2        # default: flagged, no extra model call
+    C.REPAIR_PASS = True
+    try:
+        t = run_turn(MockLLM(invent_first=True), p, "q", [], {})
+        assert "7.77" not in t.text and not t.unverified and t.timing["model_calls"] == 3
+    finally:
+        C.REPAIR_PASS = False
     assert unverified_numbers("strike rate 7.77", [{"a": 1.5}]) == ["7.77"]
     assert unverified_numbers("economy 8.5", [{"Econ": 8.49}]) == []   # rounding tolerant
 
@@ -331,6 +340,15 @@ def test_groq_client_request_shape_and_retry():
     call = s.calls[0]
     assert call["url"] == "https://api.groq.com/openai/v1/chat/completions" and call["headers"]["Authorization"] == "Bearer gsk_x"
     assert call["json"]["tool_choice"] == "auto" and call["json"]["tools"][0]["type"] == "function"
+    assert call["json"]["reasoning_effort"] == "low" and call["json"]["max_completion_tokens"] == 2048   # gpt-oss speed settings
+
+
+def test_groq_client_drops_unsupported_speed_settings():
+    rej = _Resp(400, {"error": {"message": "reasoning_effort is not supported with this model"}})
+    s = _Sess([rej, _Resp(200, OK), _Resp(200, OK)])
+    c = GroqClient("gsk_x", model="openai/gpt-oss-120b", session=s)
+    c.chat([{"role": "user", "content": "x"}]); c.chat([{"role": "user", "content": "y"}])
+    assert "reasoning_effort" in s.calls[0]["json"] and "reasoning_effort" not in s.calls[1]["json"] and "reasoning_effort" not in s.calls[2]["json"]
 
 
 def test_groq_client_falls_back_on_bad_tool_call():
