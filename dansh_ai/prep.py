@@ -132,15 +132,20 @@ def _possible_same(d: pd.DataFrame) -> List[Dict]:
     """Informational only (never merged): a one-word name equal to the last word of a longer name, same hand."""
     out: List[Dict] = []
     for col, hand, role in (("Bowler", "BowlerRH", "bowler"), ("Batter", "BatterRH", "batter")):
-        t = d.groupby(col).agg(n=("Runs", "size"), rh=(hand, "first"), y0=("Year", "min"), y1=("Year", "max"))
-        for nm, r in t.iterrows():
+        t = d.groupby(col).agg(n=("Runs", "size"), rh=(hand, "first"), y0=("Year", "min"), y1=("Year", "max")).to_dict("index")
+        by_last: Dict[str, List[str]] = {}
+        for nm in t:
+            if " " in nm:
+                by_last.setdefault(nm.split()[-1], []).append(nm)
+        for nm, r in t.items():
             if " " in nm:
                 continue
-            for other, r2 in t.iterrows():
-                if other != nm and other.split()[-1] == nm and r2["rh"] == r["rh"]:
-                    out.append({"role": role, "short_name": nm, "short_years": [int(r.y0), int(r.y1)], "short_balls": int(r.n),
-                                "full_name": other, "full_years": [int(r2.y0), int(r2.y1)], "full_balls": int(r2.n),
-                                "years_overlap": bool(r.y0 <= r2.y1 and r2.y0 <= r.y1)})
+            for other in by_last.get(nm, []):
+                r2 = t[other]
+                if r2["rh"] == r["rh"]:
+                    out.append({"role": role, "short_name": nm, "short_years": [int(r["y0"]), int(r["y1"])], "short_balls": int(r["n"]),
+                                "full_name": other, "full_years": [int(r2["y0"]), int(r2["y1"])], "full_balls": int(r2["n"]),
+                                "years_overlap": bool(r["y0"] <= r2["y1"] and r2["y0"] <= r["y1"])})
     return out
 
 

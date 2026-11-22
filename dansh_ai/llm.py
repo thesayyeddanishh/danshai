@@ -5,6 +5,7 @@ function + arguments) and INTERPRETS (writes the answer from returned numbers). 
 """
 from __future__ import annotations
 
+import io
 import json
 import re
 import time
@@ -33,6 +34,8 @@ class GroqClient:
                  base_url: str = C.GROQ_BASE_URL, session: Optional[requests.Session] = None):
         self.api_key, self.model, self.fallback_model = api_key, model, fallback_model
         self.base_url, self.session = base_url.rstrip("/"), session or requests.Session()
+        self.on_status: Optional[Callable[[str], None]] = None   # UI hook: shown while waiting on rate limits
+        self.use_extras = True                                   # reasoning_effort / max_completion_tokens
 
     def _post(self, payload: Dict) -> Dict:
         url = f"{self.base_url}/chat/completions"
@@ -46,6 +49,8 @@ class GroqClient:
                     wait = float(r.headers.get("retry-after", 2 * (attempt + 1)))
                 except ValueError:
                     wait = 2.0 * (attempt + 1)
+                if self.on_status:
+                    self.on_status(f"Groq is busy ({r.status_code}) - waiting {min(wait, 20.0):.0f}s, retry {attempt + 1}/3...")
                 time.sleep(min(wait, 20.0))
                 continue
             raise GroqHTTPError(r.status_code, r.text)
@@ -59,12 +64,26 @@ class GroqClient:
         last: Optional[Exception] = None
         for model, temp in attempts:
             payload: Dict[str, Any] = {"model": model, "messages": messages, "temperature": temp}
+            if self.use_extras:
+                payload["max_completion_tokens"] = C.MAX_COMPLETION_TOKENS
+                if C.REASONING_EFFORT and model.startswith("openai/gpt-oss"):
+                    payload["reasoning_effort"] = C.REASONING_EFFORT   # fewer hidden reasoning tokens = faster
             if tools:
                 payload["tools"], payload["tool_choice"] = tools, "auto"
             try:
                 return self._post(payload)["choices"][0]["message"]
             except GroqHTTPError as e:
                 last = e
+                if e.status == 400 and self.use_extras and ("reasoning_effort" in e.body or "max_completion_tokens" in e.body):
+                    self.use_extras = False                      # this model rejects the speed settings: drop them for good
+                    slim = {k: v for k, v in payload.items() if k not in ("reasoning_effort", "max_completion_tokens")}
+                    try:
+                        return self._post(slim)["choices"][0]["message"]
+                    except GroqHTTPError as e2:
+                        last = e2
+                        if e2.status != 400:
+                            raise
+                        continue
                 if e.status == 400 and ("tool_use_failed" in e.body or "failed_generation" in e.body or "tool" in e.body.lower()):
                     continue  # malformed tool call -> retry / fall back
                 raise
@@ -148,6 +167,14 @@ class Turn:
     confidence: List[Dict] = field(default_factory=list)
     filters: List[str] = field(default_factory=list)
     unverified: List[str] = field(default_factory=list)
+    timing: Dict[str, float] = field(default_factory=dict)
+
+
+def fig_to_png(fig) -> bytes:
+    """Render once; the page shows PNG bytes so old charts are never re-drawn on later reruns."""
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=110, bbox_inches="tight")
+    return buf.getvalue()
 
 
 def run_turn(client, prep: Prepared, user_text: str, history: List[Dict], state: Dict,
@@ -156,8 +183,21 @@ def run_turn(client, prep: Prepared, user_text: str, history: List[Dict], state:
     msgs += history[-C.HISTORY_TURNS:] + [{"role": "user", "content": user_text}]
     turn, results = Turn(text=""), []
     final = None
+    t_start, t_llm, t_py, n_llm = time.perf_counter(), 0.0, 0.0, 0
+
+    def llm(m, tools):
+        nonlocal t_llm, n_llm
+        t0 = time.perf_counter()
+        try:
+            return client.chat(m, tools=tools)
+        finally:
+            t_llm += time.perf_counter() - t0
+            n_llm += 1
+
     for _ in range(C.MAX_TOOL_STEPS):
-        msg = client.chat(msgs, tools=TOOLS)
+        if on_status:
+            on_status("Planning..." if n_llm == 0 else "Writing the answer...")
+        msg = llm(msgs, TOOLS)
         calls = msg.get("tool_calls") or []
         if not calls:
             final = msg.get("content") or ""
@@ -171,7 +211,9 @@ def run_turn(client, prep: Prepared, user_text: str, history: List[Dict], state:
                 args = None
             if on_status:
                 on_status(f"Calculating: {fn}")
+            t0 = time.perf_counter()
             out: ToolOutput = execute(fn, args, prep, state) if isinstance(args, dict) else ToolOutput({"error": "arguments were not valid JSON"})
+            t_py += time.perf_counter() - t0
             results.append(out.result)
             turn.calls.append({"tool": fn, "args": args})
             turn.figures += out.figures
@@ -182,12 +224,16 @@ def run_turn(client, prep: Prepared, user_text: str, history: List[Dict], state:
             msgs.append({"role": "tool", "tool_call_id": call.get("id", fn), "name": fn, "content": shrink_json(out.result)})
     if final is None:  # ran out of steps: force a written answer from what we have
         msgs.append({"role": "user", "content": "Write the answer now from the results above. Do not call more functions."})
-        final = client.chat(msgs, tools=None).get("content") or ""
+        final = llm(msgs, None).get("content") or ""
     bad = unverified_numbers(final, results) if results else []
-    if bad:  # one repair pass: only numbers from the results
+    if bad and C.REPAIR_PASS:  # optional extra model call: only numbers from the results
         msgs.append({"role": "assistant", "content": final})
         msgs.append({"role": "user", "content": f"These numbers are not in the function results: {', '.join(bad)}. Rewrite the answer using ONLY numbers from the results (drop anything you cannot support)."})
-        final = client.chat(msgs, tools=None).get("content") or final
+        final = llm(msgs, None).get("content") or final
         bad = unverified_numbers(final, results)
+    t0 = time.perf_counter()
+    turn.figures = [(cap, fig_to_png(f)) for cap, f in turn.figures]
+    t_py += time.perf_counter() - t0
     turn.text, turn.unverified = final.strip(), bad
+    turn.timing = {"total_s": round(time.perf_counter() - t_start, 1), "model_s": round(t_llm, 1), "model_calls": n_llm, "calc_s": round(t_py, 2)}
     return turn

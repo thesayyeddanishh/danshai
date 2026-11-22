@@ -9,6 +9,9 @@ MAX_TOOL_STEPS = 6                             # planner <-> Python round trips 
 HISTORY_TURNS = 8                              # previous user/assistant messages sent back to the model
 TOOL_RESULT_MAX_CHARS = 9000                   # cap on what is sent to the model per tool result
 LLM_TEMPERATURE = 0.1
+REASONING_EFFORT = "low"                       # Groq supports low/medium/high on openai/gpt-oss-* only; "" to disable
+MAX_COMPLETION_TOKENS = 2048                   # caps runaway generations (includes reasoning tokens)
+REPAIR_PASS = False                            # True = extra model call to rewrite answers with untraceable numbers (slower)
 
 # ---- Data cleaning (applied to a DERIVED copy; the uploaded data is never modified) ---------------
 # Plausible physical ranges, applied PER METRIC (a bad BounceX never removes the ball's runs/wicket).
